@@ -58,29 +58,29 @@ def http_json(url, cookie=None, data=None):
 
 
 def enrich_cookie(cookie):
-    """先访问B站首页，收集 WAF 种下的 Cookie（b_nut/_uuid/b_lsid 等），
-    模拟真实浏览器"先逛首页再调接口"的行为，解 feed/space 的 412"""
+    """先访问B站首页（跟随重定向），用 CookieJar 收割 WAF 种下的 Cookie
+    （b_nut/b_lsid 等），模拟真实浏览器"先逛首页再调接口"，解 feed/space 的 412"""
+    import http.cookiejar
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    req = urllib.request.Request("https://www.bilibili.com/", headers={
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Cookie": cookie})
     try:
-        req = urllib.request.Request("https://www.bilibili.com/", headers={
-            "User-Agent": UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-            "Cookie": cookie})
-        opener = urllib.request.build_opener(NoRedirect())
         with opener.open(req, timeout=15) as r:
-            have = {c.split("=")[0].strip() for c in cookie.split(";")}
-            for v in r.headers.get_all("Set-Cookie") or []:
-                kv = v.split(";")[0].strip()
-                if "=" in kv and kv.split("=")[0].strip() not in have:
-                    cookie += "; " + kv
+            r.read(256)
     except Exception as e:
-        print("enrich skipped: %r" % e)
+        print("enrich page err: %r" % e)
+    have = {c.split("=")[0].strip() for c in cookie.split(";") if "=" in c}
+    add = ["%s=%s" % (c.name, c.value) for c in jar if c.name not in have]
+    if add:
+        print("enriched: +%s" % ",".join(c.name for c in jar if c.name not in have))
+        cookie += "; " + "; ".join(add)
+    else:
+        print("enrich: no new cookies")
     return cookie
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
 
 
 BUVID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "buvid.txt")
