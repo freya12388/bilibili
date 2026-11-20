@@ -30,15 +30,31 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "
 def http_json(url, cookie=None, data=None):
     headers = {"User-Agent": UA,
                "Accept": "application/json, text/plain, */*",
-               "Accept-Language": "zh-CN,zh;q=0.9"}
+               "Accept-Language": "zh-CN,zh;q=0.9",
+               "Accept-Encoding": "gzip, deflate",
+               "Cache-Control": "no-cache",
+               "Origin": "https://space.bilibili.com",
+               "Referer": "https://space.bilibili.com/%s/dynamic" % UP_MID,
+               "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+               "sec-ch-ua-mobile": "?0",
+               "sec-ch-ua-platform": '"Windows"',
+               "Sec-Fetch-Dest": "empty",
+               "Sec-Fetch-Mode": "cors",
+               "Sec-Fetch-Site": "same-site"}
     if cookie:
         headers["Cookie"] = cookie
-        headers["Referer"] = "https://space.bilibili.com/%s/dynamic" % UP_MID
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read()
+            if raw[:2] == b"\x1f\x8b":            # gzip 响应自动解压
+                import gzip
+                raw = gzip.decompress(raw)
+            return json.loads(raw.decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("HTTP %s for %s" % (e.code, url[:110])) from e
 
 
 BUVID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "buvid.txt")
@@ -73,12 +89,18 @@ MIXIN_TAB = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27,
 
 
 def get_wbi_key(cookie):
-    nav = http_json("https://api.bilibili.com/x/web-interface/nav", cookie=cookie)
-    wbi = (nav.get("data") or {}).get("wbi_img") or {}
-    raw = ""
-    for u in (wbi.get("img_url") or "", wbi.get("sub_url") or ""):
-        raw += re.sub(r"\.png|\.jpg", "", os.path.basename(u))
-    return "".join(raw[i] for i in MIXIN_TAB if i < len(raw))[:32]
+    """取WBI签名key；nav 被风控时返回 None（降级为不签名请求）"""
+    try:
+        nav = http_json("https://api.bilibili.com/x/web-interface/nav", cookie=cookie)
+        wbi = (nav.get("data") or {}).get("wbi_img") or {}
+        raw = ""
+        for u in (wbi.get("img_url") or "", wbi.get("sub_url") or ""):
+            raw += re.sub(r"\.png|\.jpg", "", os.path.basename(u))
+        key = "".join(raw[i] for i in MIXIN_TAB if i < len(raw))[:32]
+        return key if key else None
+    except Exception as e:
+        print("wbi key unavailable: %r" % e)
+        return None
 
 
 def wbi_sign(params, key):
@@ -95,11 +117,14 @@ def fetch_dynamics():
     cookie = get_cookie()
     if SESSDATA:
         cookie += "; SESSDATA=%s" % SESSDATA
+    params = {"host_mid": UP_MID, "timezone_offset": -480, "features": FEATURES}
     key = get_wbi_key(cookie)
-    qs = wbi_sign({"host_mid": UP_MID, "timezone_offset": -480,
-                   "features": FEATURES}, key)
+    if key:
+        params = wbi_sign(params, key)
+    else:
+        print("fetch without wbi sign")
     url = ("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?%s"
-           % urllib.parse.urlencode(qs))
+           % urllib.parse.urlencode(params))
     d = http_json(url, cookie=cookie)
     if d.get("code") != 0:
         raise RuntimeError("bili api code=%s msg=%s" % (d.get("code"), d.get("message")))
