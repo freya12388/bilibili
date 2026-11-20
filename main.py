@@ -21,7 +21,9 @@ SESSDATA = os.environ.get("BILI_SESSDATA", "")            # 可选：B站小号c
 PUSH_URL = "http://www.pushplus.plus/send"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-PUSH_TYPES = {"DYNAMIC_TYPE_DRAW", "DYNAMIC_TYPE_WORD"}   # 图文 / 纯文字动态
+PUSH_TYPES = {"DYNAMIC_TYPE_DRAW", "DYNAMIC_TYPE_WORD", "DYNAMIC_TYPE_OPUS"}  # 图文/文字/新版opus
+FEATURES = ("itemOpusStyle,opusBigCover,onlyEndVote,decorationCard,"
+            "onlyOriginal,originList,ugcDelete,onlyForFans")   # 返回新版opus结构，正文在 major.opus.summary.text
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "last.txt")
 
 
@@ -94,7 +96,8 @@ def fetch_dynamics():
     if SESSDATA:
         cookie += "; SESSDATA=%s" % SESSDATA
     key = get_wbi_key(cookie)
-    qs = wbi_sign({"host_mid": UP_MID, "timezone_offset": -480}, key)
+    qs = wbi_sign({"host_mid": UP_MID, "timezone_offset": -480,
+                   "features": FEATURES}, key)
     url = ("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?%s"
            % urllib.parse.urlencode(qs))
     d = http_json(url, cookie=cookie)
@@ -106,14 +109,26 @@ def fetch_dynamics():
         author = mod.get("module_author") or {}
         uname = author.get("name") or uname
         dyn = mod.get("module_dynamic") or {}
-        text = ((dyn.get("desc") or {}).get("text") or "").strip()
+        major = dyn.get("major") or {}
+        opus = major.get("opus") or {}
+        # 正文：新版opus结构优先，老结构 desc.text 兜底
+        text = ((opus.get("summary") or {}).get("text")
+                or (dyn.get("desc") or {}).get("text") or "").strip()
         pics = []
-        for p in (((dyn.get("major") or {}).get("draw") or {}).get("items") or []):
+        for p in (opus.get("pics") or []):                    # 新版图片
+            u = p.get("url") or p.get("src")
+            if u:
+                pics.append(u)
+        for p in ((major.get("draw") or {}).get("items") or []):   # 老版图片
             if p.get("src"):
                 pics.append(p["src"])
+        link = ""
+        ju = opus.get("jump_url") or ""
+        if ju.startswith("//"):
+            link = "https:" + ju
         if it.get("id_str"):
             items.append({"id": str(it["id_str"]), "type": it.get("type", ""),
-                          "uname": uname, "text": text, "pics": pics})
+                          "uname": uname, "text": text, "pics": pics, "url": link})
     items.sort(key=lambda x: int(x["id"]))
     return items
 
@@ -133,12 +148,12 @@ def save_last(v):
 
 
 def push(item):
-    link = "https://t.bilibili.com/%s" % item["id"]
+    link = item.get("url") or ("https://t.bilibili.com/%s" % item["id"])
     title = "【B站】%s 发了新动态" % item["uname"]
     if SCKEY:      # Server酱：markdown 格式，免费每日5条
-        text = (item["text"] or "(无文字内容)")[:600]
-        img = ("![图](%s)" % item["pics"][0]) if item["pics"] else ""
-        desp = "%s\n\n%s\n\n[查看动态](%s)" % (text, img, link)
+        text = (item["text"] or "(无文字内容)")[:20000]
+        imgs = "".join(("![图](%s)\n\n" % u) for u in item["pics"][:9])
+        desp = "%s\n\n%s[原文链接](%s)" % (text, imgs, link)
         body = urllib.parse.urlencode({"title": title, "desp": desp}).encode("utf-8")
         req = urllib.request.Request("https://sctapi.ftqq.com/%s.send" % SCKEY, data=body)
         with urllib.request.urlopen(req, timeout=20) as r:
@@ -146,12 +161,13 @@ def push(item):
         ok = res.get("code") == 0
         print("push(serverchan) %s ok=%s" % (item["id"], ok))
         return ok
-    # PushPlus：html 格式（注意：需实名 verify.pushplus.plus）
+    # PushPlus：html 格式（需实名 verify.pushplus.plus）
     text = html.escape(item["text"] or "(无文字内容)")
-    if len(text) > 600:
-        text = text[:600] + "..."
-    img = ('<br><img src="%s" style="max-width:100%%"/>' % item["pics"][0]) if item["pics"] else ""
-    content = '<p>%s</p>%s<p><a href="%s">查看动态</a></p>' % (text, img, link)
+    if len(text) > 20000:
+        text = text[:20000] + "..."
+    text = text.replace("\n", "<br>")                        # 保留段落换行
+    imgs = "".join('<br><img src="%s" style="max-width:100%%"/>' % u for u in item["pics"][:9])
+    content = '<p>%s</p>%s<p><a href="%s">原文链接</a></p>' % (text, imgs, link)
     body = json.dumps({"token": TOKEN, "title": title,
                        "content": content, "template": "html"}).encode("utf-8")
     res = http_json(PUSH_URL, data=body)
@@ -178,8 +194,11 @@ def main():
         return
 
     if last is None:                            # 首次运行：只记基线，不推送
-        save_last(int(items[-1]["id"]) if items else 0)
-        print("first run, baseline saved")
+        if items:
+            save_last(int(items[-1]["id"]))
+            print("first run, baseline saved: %s" % items[-1]["id"])
+        else:                                   # 空列表(风控抖动)不落基线，下轮重试
+            print("first run got empty feed; skip baseline")
         return
 
     cursor = last
