@@ -1,0 +1,200 @@
+# -*- coding: utf-8 -*-
+"""
+B站UP主动态监控 → PushPlus 微信推送
+- 由 GitHub Actions 每分钟触发
+- 只推送图文动态(DRAW)和文字动态(WORD)，其余类型(视频投稿/直播等)只推进游标不推送
+- state/last.txt 记录游标(最新已处理 dynamic id)，由 workflow 自动 commit 回仓库
+"""
+import hashlib
+import html
+import json
+import os
+import re
+import time
+import urllib.parse
+import urllib.request
+
+UP_MID   = os.environ.get("UP_MID", "3706962053172003")   # 我走路带风风风
+TOKEN    = os.environ.get("PUSHPLUS_TOKEN", "")           # PushPlus token（需实名）
+SCKEY    = os.environ.get("SERVERCHAN_SENDKEY", "")       # Server酱 SendKey（推荐，微信扫码即得）
+SESSDATA = os.environ.get("BILI_SESSDATA", "")            # 可选：B站小号cookie，提高稳定性
+PUSH_URL = "http://www.pushplus.plus/send"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+PUSH_TYPES = {"DYNAMIC_TYPE_DRAW", "DYNAMIC_TYPE_WORD"}   # 图文 / 纯文字动态
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "last.txt")
+
+
+def http_json(url, cookie=None, data=None):
+    headers = {"User-Agent": UA,
+               "Accept": "application/json, text/plain, */*",
+               "Accept-Language": "zh-CN,zh;q=0.9"}
+    if cookie:
+        headers["Cookie"] = cookie
+        headers["Referer"] = "https://space.bilibili.com/%s/dynamic" % UP_MID
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+BUVID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "buvid.txt")
+
+
+def get_cookie():
+    """指纹 cookie 持久化复用（模拟真实浏览器：同一 buvid 反复使用）"""
+    cookie = ""
+    try:
+        with open(BUVID_FILE, encoding="utf-8") as f:
+            cookie = f.read().strip()
+    except Exception:
+        pass
+    if not cookie:
+        spi = http_json("https://api.bilibili.com/x/frontend/finger/spi")
+        cookie = "buvid3=%s; buvid4=%s" % (spi["data"]["b_3"], spi["data"]["b_4"])
+        os.makedirs(os.path.dirname(BUVID_FILE), exist_ok=True)
+        with open(BUVID_FILE, "w", encoding="utf-8") as f:
+            f.write(cookie)
+        try:   # 新指纹先预热注册一次
+            http_json("https://api.bilibili.com/x/web-interface/nav", cookie=cookie)
+        except Exception:
+            pass
+    return cookie
+
+
+# WBI 签名（B站网页接口标准算法，-352 风控的正解）
+MIXIN_TAB = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27,
+             43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37,
+             48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25,
+             54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52]
+
+
+def get_wbi_key(cookie):
+    nav = http_json("https://api.bilibili.com/x/web-interface/nav", cookie=cookie)
+    wbi = (nav.get("data") or {}).get("wbi_img") or {}
+    raw = ""
+    for u in (wbi.get("img_url") or "", wbi.get("sub_url") or ""):
+        raw += re.sub(r"\.png|\.jpg", "", os.path.basename(u))
+    return "".join(raw[i] for i in MIXIN_TAB if i < len(raw))[:32]
+
+
+def wbi_sign(params, key):
+    params = dict(params)
+    params["wts"] = int(time.time())
+    params = {k: str(v).replace("!'()*", "") for k, v in params.items()}
+    qs = urllib.parse.urlencode(sorted(params.items()))
+    params["w_rid"] = hashlib.md5((qs + key).encode()).hexdigest()
+    return params
+
+
+def fetch_dynamics():
+    """返回 items（按 id 正序）；code!=0 或网络异常时抛错"""
+    cookie = get_cookie()
+    if SESSDATA:
+        cookie += "; SESSDATA=%s" % SESSDATA
+    key = get_wbi_key(cookie)
+    qs = wbi_sign({"host_mid": UP_MID, "timezone_offset": -480}, key)
+    url = ("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?%s"
+           % urllib.parse.urlencode(qs))
+    d = http_json(url, cookie=cookie)
+    if d.get("code") != 0:
+        raise RuntimeError("bili api code=%s msg=%s" % (d.get("code"), d.get("message")))
+    items, uname = [], UP_MID
+    for it in (d.get("data") or {}).get("items") or []:
+        mod = it.get("modules", {})
+        author = mod.get("module_author") or {}
+        uname = author.get("name") or uname
+        dyn = mod.get("module_dynamic") or {}
+        text = ((dyn.get("desc") or {}).get("text") or "").strip()
+        pics = []
+        for p in (((dyn.get("major") or {}).get("draw") or {}).get("items") or []):
+            if p.get("src"):
+                pics.append(p["src"])
+        if it.get("id_str"):
+            items.append({"id": str(it["id_str"]), "type": it.get("type", ""),
+                          "uname": uname, "text": text, "pics": pics})
+    items.sort(key=lambda x: int(x["id"]))
+    return items
+
+
+def load_last():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return int(f.read().strip() or 0)
+    except Exception:
+        return None      # 首次运行
+
+
+def save_last(v):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        f.write(str(v))
+
+
+def push(item):
+    link = "https://t.bilibili.com/%s" % item["id"]
+    title = "【B站】%s 发了新动态" % item["uname"]
+    if SCKEY:      # Server酱：markdown 格式，免费每日5条
+        text = (item["text"] or "(无文字内容)")[:600]
+        img = ("![图](%s)" % item["pics"][0]) if item["pics"] else ""
+        desp = "%s\n\n%s\n\n[查看动态](%s)" % (text, img, link)
+        body = urllib.parse.urlencode({"title": title, "desp": desp}).encode("utf-8")
+        req = urllib.request.Request("https://sctapi.ftqq.com/%s.send" % SCKEY, data=body)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            res = json.loads(r.read().decode("utf-8"))
+        ok = res.get("code") == 0
+        print("push(serverchan) %s ok=%s" % (item["id"], ok))
+        return ok
+    # PushPlus：html 格式（注意：需实名 verify.pushplus.plus）
+    text = html.escape(item["text"] or "(无文字内容)")
+    if len(text) > 600:
+        text = text[:600] + "..."
+    img = ('<br><img src="%s" style="max-width:100%%"/>' % item["pics"][0]) if item["pics"] else ""
+    content = '<p>%s</p>%s<p><a href="%s">查看动态</a></p>' % (text, img, link)
+    body = json.dumps({"token": TOKEN, "title": title,
+                       "content": content, "template": "html"}).encode("utf-8")
+    res = http_json(PUSH_URL, data=body)
+    ok = res.get("code") == 200
+    print("push(pushplus) %s ok=%s msg=%s" % (item["id"], ok, res.get("message")))
+    return ok
+
+
+def main():
+    if not TOKEN and not SCKEY:
+        print("missing PUSHPLUS_TOKEN / SERVERCHAN_SENDKEY")
+        return
+    last = load_last()
+
+    for attempt in range(3):                    # 拉取重试
+        try:
+            items = fetch_dynamics()
+            break
+        except Exception as e:
+            print("fetch retry %d: %r" % (attempt + 1, e))
+            time.sleep(3 * (attempt + 1))
+    else:
+        print("fetch failed; state untouched, retry next run")
+        return
+
+    if last is None:                            # 首次运行：只记基线，不推送
+        save_last(int(items[-1]["id"]) if items else 0)
+        print("first run, baseline saved")
+        return
+
+    cursor = last
+    for item in [i for i in items if int(i["id"]) > last]:
+        if item["type"] in PUSH_TYPES:
+            if push(item):
+                cursor = int(item["id"])
+            else:
+                break                           # 推送失败：游标停在成功处，下轮重推
+        else:
+            cursor = int(item["id"])            # 非推送类型(如视频投稿)只推进游标
+    if cursor != last:
+        save_last(cursor)
+    print("done. cursor=%s new_items=%d" % (cursor, len([i for i in items if int(i['id']) > last])))
+
+
+if __name__ == "__main__":
+    main()
