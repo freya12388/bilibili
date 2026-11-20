@@ -57,6 +57,32 @@ def http_json(url, cookie=None, data=None):
         raise RuntimeError("HTTP %s for %s" % (e.code, url[:110])) from e
 
 
+def enrich_cookie(cookie):
+    """先访问B站首页，收集 WAF 种下的 Cookie（b_nut/_uuid/b_lsid 等），
+    模拟真实浏览器"先逛首页再调接口"的行为，解 feed/space 的 412"""
+    try:
+        req = urllib.request.Request("https://www.bilibili.com/", headers={
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Cookie": cookie})
+        opener = urllib.request.build_opener(NoRedirect())
+        with opener.open(req, timeout=15) as r:
+            have = {c.split("=")[0].strip() for c in cookie.split(";")}
+            for v in r.headers.get_all("Set-Cookie") or []:
+                kv = v.split(";")[0].strip()
+                if "=" in kv and kv.split("=")[0].strip() not in have:
+                    cookie += "; " + kv
+    except Exception as e:
+        print("enrich skipped: %r" % e)
+    return cookie
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 BUVID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "buvid.txt")
 
 
@@ -112,9 +138,13 @@ def wbi_sign(params, key):
     return params
 
 
-def fetch_dynamics():
+def fetch_dynamics(remint=False):
     """返回 items（按 id 正序）；code!=0 或网络异常时抛错"""
+    if remint and os.path.exists(BUVID_FILE):     # 重铸指纹（旧buvid可能被WAF拉黑）
+        os.remove(BUVID_FILE)
+        print("buvid reminted")
     cookie = get_cookie()
+    cookie = enrich_cookie(cookie)
     if SESSDATA:
         cookie += "; SESSDATA=%s" % SESSDATA
     params = {"host_mid": UP_MID, "timezone_offset": -480, "features": FEATURES}
@@ -207,9 +237,9 @@ def main():
         return
     last = load_last()
 
-    for attempt in range(3):                    # 拉取重试
+    for attempt in range(4):                    # 拉取重试（后两次换新指纹）
         try:
-            items = fetch_dynamics()
+            items = fetch_dynamics(remint=(attempt >= 2))
             break
         except Exception as e:
             print("fetch retry %d: %r" % (attempt + 1, e))
